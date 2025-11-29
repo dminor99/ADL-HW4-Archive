@@ -1,0 +1,234 @@
+from pathlib import Path
+
+import fire
+from matplotlib import pyplot as plt
+
+from .generate_qa import draw_detections, extract_frame_info
+import json
+import multiprocessing as mp
+from concurrent.futures import ProcessPoolExecutor
+
+
+def extract_kart_objects(info_path: str, view_index: int, img_width: int = 150, img_height: int = 100) -> list:
+    """
+    Extract kart objects from the info.json file.
+    """
+    with open(info_path) as f:
+        info_data = json.load(f)
+
+    if view_index >= len(info_data["detections"]):
+        return []
+
+    detections = info_data["detections"][view_index]
+    kart_names = info_data["karts"]
+
+    ORIGINAL_W, ORIGINAL_H = 600, 400
+    scale_x = img_width / ORIGINAL_W
+    scale_y = img_height / ORIGINAL_H
+
+    karts = []
+    for detection in detections:
+        class_id, kart_id, x1, y1, x2, y2 = detection
+        class_id = int(class_id)
+        kart_id = int(kart_id)
+        if class_id != 1:
+            continue
+
+        x1 *= scale_x
+        y1 *= scale_y
+        x2 *= scale_x
+        y2 *= scale_y
+        center_x = (x1 + x2) / 2
+        center_y = (y1 + y2) / 2
+
+        name = kart_names[kart_id] if kart_id < len(kart_names) else f"Kart {kart_id}"
+        is_ego = (kart_id == view_index)
+
+        karts.append({
+            "kart_name": name,
+            "kart_id": kart_id,
+            "center": (center_x, center_y),
+            "is_ego_kart": is_ego
+        })
+    return karts
+
+def extract_track_info(info_path: str) -> str:
+    """
+    Extract track information from the info.json file.
+    """
+    with open(info_path) as f:
+        info = json.load(f)
+    return info.get("track", "Unknown Track")
+
+
+def generate_caption(info_path: str, view_index: int, img_width: int = 150, img_height: int = 100) -> list:
+    """
+    Generate caption for a specific view.
+    """
+    # 1. Ego car
+    # {kart_name} is the ego car.
+
+    # 2. Counting
+    # There are {num_karts} karts in the scenario.
+
+    # 3. Track name
+    # The track is {track_name}.
+
+    # 4. Relative position
+    # {kart_name} is {position} of the ego car.
+
+    karts = extract_kart_objects(info_path, view_index, img_width, img_height)
+    track_name = extract_track_info(info_path)
+
+    # FIXED: 10 unique captions for empty scenes
+    if not karts:
+        return [
+            "No karts visible in this racing scene.",
+            "The track appears empty with no visible competitors.",
+            "Empty racing track — no karts detected.",
+            "Clear view of the track with no racing activity.",
+            "No kart activity visible in this frame.",
+            "The racing circuit is currently vacant.",
+            "Empty SuperTuxKart track with no participants.",
+            "No competitors visible in this view.",
+            "Scene shows a vacant racing track.",
+            "Track visibility clear — no karts in sight."
+        ]
+
+    ego_kart = next((k for k in karts if k['is_ego_kart']), karts[0])
+    ego_x, ego_y = ego_kart['center']
+    others = [k for k in karts if not k['is_ego_kart']]
+
+    # Helper: relative position
+    def rel_pos(k):
+        x, y = k['center']
+        lr = "left" if x < ego_x else "right"
+        fb = "ahead" if y < ego_y else "behind"
+        return f"{k['kart_name']} is {fb} and to the {lr}"
+
+    pos_descs = [rel_pos(k) for k in others[:3]]  # Safe: max 3
+    pos_str = " " + "; ".join(pos_descs) + "." if pos_descs else ""
+
+    captions = [
+        f"{ego_kart['kart_name']} is the ego kart racing on {track_name}.{pos_str}",
+        f"I'm driving {ego_kart['kart_name']} on {track_name} track in SuperTuxKart.",
+        f"First-person view from {ego_kart['kart_name']} competing on {track_name}.",
+        f"In-game cockpit view of {ego_kart['kart_name']} on {track_name} circuit.",
+        f"Ego vehicle: {ego_kart['kart_name']}, track: {track_name}, {len(karts)} karts visible.",
+        f"Racing as {ego_kart['kart_name']} on {track_name} with {len(others)} opponents.",
+        f"SuperTuxKart gameplay featuring {ego_kart['kart_name']} as the player on {track_name}.",
+        f"Player controls {ego_kart['kart_name']} in a race on {track_name}.",
+        f"View from {ego_kart['kart_name']}'s kart on {track_name} — {len(karts)} total participants.",
+        f"On {track_name}, {ego_kart['kart_name']} leads among {len(karts)} racing karts.",
+    ]
+
+    # REMOVED: while len(captions) < 10: append duplicate 
+    # We already have exactly 10 diverse captions
+    return captions[:10]
+
+def process_single_frame(args):
+    """Process a single frame and generate captions for all its views"""
+    info_file, data_dir = args
+    info_file = Path(info_file)
+    base_name = info_file.stem.replace("_info", "")
+    frame_captions = []
+
+    for view_index in range(10):
+        image_filename = f"{base_name}_{view_index:02d}_im.jpg"
+        image_file = info_file.parent / image_filename
+
+        if not image_file.exists():
+            continue  # Skip missing views
+
+        captions = generate_caption(str(info_file), view_index)
+        rel_path = str(image_file.relative_to(Path(data_dir)))
+
+        for caption in captions:
+            frame_captions.append({
+                'caption': caption,
+                'image_file': rel_path
+            })
+
+    return frame_captions
+
+def generate_all_captions(data_dir: str, split: str = "train", batch_size: int = 500, split_per_file: bool = False,max_workers: int = None):
+    """
+    Generate captions for all info files in the specified directory.
+    """
+    data_path = Path(data_dir) / split
+    info_files = sorted(data_path.glob("*_info.json"))
+    print(f"Found {len(info_files)} info files in {split}/")
+
+    if max_workers is None:
+        max_workers = min(16, mp.cpu_count())
+
+    all_captions = []
+
+    args = [(f, data_dir) for f in info_files]
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        for i, result in enumerate(executor.map(process_single_frame, args, chunksize=8), 1):
+            all_captions.extend(result)
+            if i % 100 == 0:
+                print(f"  Processed {i}/{len(info_files)} frames...")
+
+    if split_per_file:
+        print("Writing individual caption files (required for CLIP training)...")
+        captions_by_file = {}
+        for item in all_captions:
+            img_path = Path(item['image_file'])
+            key = img_path.stem  # e.g., 00000_00_im
+            if key not in captions_by_file:
+                captions_by_file[key] = []
+            captions_by_file[key].append(item)
+
+        for key, caps in captions_by_file.items():
+            out_file = data_path / f"{key}_captions.json"
+            with open(out_file, 'w') as f:
+                json.dump(caps, f, indent=2)
+
+        print(f"Success: Generated {len(captions_by_file)} individual caption files!")
+    else:
+        out_file = data_path / "balanced_captions.json"
+        with open(out_file, 'w') as f:
+            json.dump(all_captions, f, indent=2)
+        print(f"Success: Saved {len(all_captions)} captions to {out_file}")
+    
+  
+
+def check_caption(info_file: str, view_index: int):
+    captions = generate_caption(info_file, view_index)
+
+    print("\nCaption:")
+    print("-" * 50)
+    for i, caption in enumerate(captions):
+        print(f"{i + 1}. {caption}")
+        print("-" * 50)
+
+    info_path = Path(info_file)
+    base_name = info_path.stem.replace("_info", "")
+    image_file = list(info_path.parent.glob(f"{base_name}_{view_index:02d}_im.jpg"))[0]
+
+    annotated_image = draw_detections(str(image_file), info_file)
+
+    plt.figure(figsize=(12, 8))
+    plt.imshow(annotated_image)
+    plt.axis("off")
+    plt.title(f"Frame {extract_frame_info(str(image_file))[0]}, View {view_index}")
+    plt.show()
+
+
+"""
+Usage Example: Visualize QA pairs for a specific file and view:
+   python generate_captions.py check --info_file ../data/valid/00000_info.json --view_index 0
+
+You probably need to add additional commands to Fire below.
+"""
+
+
+def main():
+    fire.Fire({"check": check_caption,
+    "generate": generate_all_captions,})
+
+
+if __name__ == "__main__":
+    main()
